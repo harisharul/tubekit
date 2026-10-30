@@ -4,10 +4,28 @@ An MCP server, built on [yt-dlp](https://github.com/yt-dlp/yt-dlp), with two rea
 
 | Tool | What it does |
 |---|---|
-| `list_playlist_videos(playlist, limit?)` | Lists the videos in a playlist: position, ID, title, URL, duration, channel. Takes a playlist URL or ID. |
-| `get_video_transcript(video, language="en", prefer_manual=true, include_timestamps=false)` | Gets a video's captions as plain text, with optional `[mm:ss]` timestamps on each line. Takes a video URL or 11-character ID. |
+| `list_playlist_videos(playlist, start=1, end?, title_filter?)` | Lists playlist videos as `position. title [id] duration`. Returns 50 per call by default, 200 at most. Only the requested range is fetched from YouTube. `title_filter` returns only titles that contain all the given words. |
+| `get_video_transcript(video, language="en", prefer_manual=true, include_timestamps=false, start_time?, end_time?, offset=0, max_chars=20000)` | Returns a transcript one page at a time. You can limit it to a time window (`"10:00"`-`"15:00"`); the first page lists the video's chapters so Claude can jump to a section. |
 
-Nothing is downloaded except metadata and caption files. The server uses creator-uploaded captions when they exist and auto-generated ones otherwise. Regional variants count as a match, so asking for `en` can return `en-US`. If the requested language doesn't exist, the error lists the languages that do.
+### Designed to save tokens
+
+Everything a tool returns is read by the model, so the tools:
+
+- **Return compact text, not JSON.** No indentation, no repeated keys, and no duplicate structured copy.
+- **Page by default.** Each result ends with a `More: call again with start=…` or `offset=…` hint when there is more.
+- **Filter on the server.** `title_filter` and time windows mean Claude doesn't need the full list or full transcript to find one thing.
+- **Cache transcripts in memory** (last 32 videos), so reading a long video page by page hits YouTube only once.
+
+Measured on a 246-video playlist and a 39-minute video (the old figures include the duplicate structured copy, so text alone was about half):
+
+| Request | Before | Now |
+|---|---|---|
+| Videos 4-10 of a playlist | ~28k tokens (whole list) | ~170 tokens |
+| Videos with "fractal" in the title | ~28k tokens | ~290 tokens |
+| One minute of a transcript, with timestamps | ~20k tokens (whole video) | ~340 tokens |
+| Whole transcript | ~16k tokens in one call | ~5k tokens per page |
+
+The server uses creator-uploaded captions when they exist and auto-generated ones otherwise. Regional variants count as a match, so asking for `en` can return `en-US`. If the requested language doesn't exist, the error lists the languages that do.
 
 ## Requirements
 

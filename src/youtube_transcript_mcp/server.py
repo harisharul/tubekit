@@ -1,4 +1,9 @@
-"""MCP server exposing YouTube playlist listing and transcript fetching."""
+"""MCP server exposing YouTube playlist listing and transcript fetching.
+
+Tools return compact plain text rather than JSON: every result is read by the
+model, so indentation, repeated keys and duplicate structured copies all cost
+tokens. Each result says how to fetch the next page when there is more.
+"""
 
 from __future__ import annotations
 
@@ -12,52 +17,144 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from . import youtube
+from .youtube import format_timestamp
+
+DEFAULT_PAGE_SIZE = 50
+MAX_PAGE_SIZE = 200
 
 mcp = MCPServer(
     name="youtube-transcript",
     instructions=(
         "Use list_playlist_videos to see what videos a YouTube playlist contains, "
-        "then get_video_transcript with a video ID or URL to read what is said in it."
+        "then get_video_transcript with a video ID or URL to read what is said in it. "
+        "Both tools return one page at a time: request only the range you need "
+        "(start/end, title_filter, start_time/end_time) and follow the 'More:' hint "
+        "only when the remaining content is actually needed."
     ),
 )
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
 
 
-@mcp.tool(annotations=READ_ONLY)
+def _format_playlist(data: dict[str, Any], start: int, end: int, title_filter: str | None) -> str:
+    videos = data["videos"]
+    total = data["total_videos"]
+    head = f"Playlist: {data['title']} | {data['channel']} | {total} videos | id {data['playlist_id']}"
+    if title_filter:
+        matched = data["matched_videos"]
+        head += f"\nFilter '{title_filter}': {matched} matches"
+        available = matched
+    else:
+        available = total
+    if not videos:
+        return head + f"\nNo videos in range {start}-{end}."
+
+    lines = [head, f"Showing {start}-{start + len(videos) - 1}" + (" of matches" if title_filter else "")]
+    lines += [
+        f"{v['position']}. {v['title']} [{v['id']}] {format_timestamp(v['duration_seconds'])}"
+        for v in videos
+    ]
+    last = start + len(videos) - 1
+    if available is not None and last < available:
+        lines.append(f"More: call again with start={last + 1}.")
+    return "\n".join(lines)
+
+
+def _format_transcript(data: dict[str, Any]) -> str:
+    kind = "auto-generated" if data["auto_generated"] else "manual"
+    lines = [
+        f"Video: {data['title']} | {data['channel']} | {format_timestamp(data['duration_seconds'])}"
+        f" | id {data['video_id']} | captions {data['language']} ({kind})"
+    ]
+    if data["chapters"]:
+        lines.append(
+            "Chapters: " + "; ".join(f"{format_timestamp(c['start'])} {c['title']}" for c in data["chapters"])
+        )
+    if data["page_start"] is None:
+        lines.append("No captions in the requested range.")
+        return "\n".join(lines)
+    lines.append(f"Covers {format_timestamp(data['page_start'])}-{format_timestamp(data['page_end'])}")
+    if data["next_offset"] is not None:
+        lines.append(f"More: call again with offset={data['next_offset']} (same other arguments).")
+    lines += ["", data["transcript"]]
+    return "\n".join(lines)
+
+
+@mcp.tool(annotations=READ_ONLY, structured_output=False)
 async def list_playlist_videos(
     playlist: Annotated[str, Field(description="Playlist URL or playlist ID (e.g. PLxxxx).")],
-    limit: Annotated[
-        int | None, Field(description="Maximum number of videos to return. Omit for all.", ge=1)
+    start: Annotated[int, Field(description="1-based position of the first video to return.", ge=1)] = 1,
+    end: Annotated[
+        int | None,
+        Field(
+            description=f"1-based position of the last video to return (inclusive). "
+            f"Defaults to start+{DEFAULT_PAGE_SIZE - 1}; at most {MAX_PAGE_SIZE} per call.",
+            ge=1,
+        ),
     ] = None,
-) -> dict[str, Any]:
-    """List the videos in a YouTube playlist (position, ID, title, URL, duration)."""
+    title_filter: Annotated[
+        str | None,
+        Field(
+            description="Only return videos whose title contains all of these words "
+            "(case-insensitive). start/end then page through the matches."
+        ),
+    ] = None,
+) -> str:
+    """List videos in a YouTube playlist as 'position. title [video_id] duration'.
+
+    Returns one page (default 50). Ask for exactly the range needed, e.g. start=4,
+    end=10, or use title_filter instead of listing everything and filtering yourself.
+    """
+    end = min(end or start + DEFAULT_PAGE_SIZE - 1, start + MAX_PAGE_SIZE - 1)
     try:
-        return await anyio.to_thread.run_sync(youtube.list_playlist, playlist, limit)
+        data = await anyio.to_thread.run_sync(youtube.list_playlist, playlist, start, end, title_filter)
     except youtube.YouTubeError as e:
         raise ToolError(str(e)) from e
+    return _format_playlist(data, start, end, title_filter)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@mcp.tool(annotations=READ_ONLY, structured_output=False)
 async def get_video_transcript(
     video: Annotated[str, Field(description="Video URL or 11-character video ID.")],
-    language: Annotated[
-        str, Field(description="Caption language code, e.g. 'en', 'hi', 'ta'.")
-    ] = "en",
+    language: Annotated[str, Field(description="Caption language code, e.g. 'en', 'hi', 'ta'.")] = "en",
     prefer_manual: Annotated[
         bool, Field(description="Prefer creator-uploaded captions over auto-generated ones.")
     ] = True,
     include_timestamps: Annotated[
-        bool, Field(description="Prefix each caption line with its [mm:ss] start time.")
+        bool,
+        Field(description="Prefix each caption line with [mm:ss]. Costs extra tokens; use when times matter."),
     ] = False,
-) -> dict[str, Any]:
-    """Fetch the transcript (captions) of a YouTube video."""
+    start_time: Annotated[
+        float | str | None,
+        Field(description="Only include captions from this time on: seconds or 'mm:ss' / 'hh:mm:ss'."),
+    ] = None,
+    end_time: Annotated[
+        float | str | None,
+        Field(description="Only include captions before this time: seconds or 'mm:ss' / 'hh:mm:ss'."),
+    ] = None,
+    offset: Annotated[
+        int, Field(description="Continue a previous call: pass the offset from its 'More:' line.", ge=0)
+    ] = 0,
+    max_chars: Annotated[
+        int,
+        Field(description="Maximum transcript characters to return in this call (~4 chars per token).", ge=1000, le=100000),
+    ] = 20000,
+) -> str:
+    """Fetch a YouTube video's transcript (captions), one page at a time.
+
+    Long videos are split into pages of max_chars; the result says which time range
+    it covers and the offset for the next page. Chapters (if any) are listed on the
+    first page so you can fetch just one section with start_time/end_time.
+    """
     try:
-        return await anyio.to_thread.run_sync(
-            youtube.get_transcript, video, language, prefer_manual, include_timestamps
+        data = await anyio.to_thread.run_sync(
+            lambda: youtube.get_transcript(
+                video, language, prefer_manual, include_timestamps, start_time, end_time, offset, max_chars
+            )
         )
     except youtube.YouTubeError as e:
         raise ToolError(str(e)) from e
+    return _format_transcript(data)
 
 
 def main() -> None:
