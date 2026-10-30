@@ -102,9 +102,10 @@ If the domain has email set up (MX records), check that Cloudflare imported thos
 3. On the install screen, choose **Docker**. Copy only the long token string after `--token`. Don't run the command; Compose runs `cloudflared` for you.
 4. Click **Next** and add a public hostname:
    - **Subdomain:** `ytmcp` (or anything you like). **Domain:** your domain.
-   - **Service type:** `HTTP`. **URL:** `mcp:8000`
+   - **Service URL:** `http://mcp:8000`. On older versions of the screen, set **Type** to `HTTP` and **URL** to `mcp:8000`.
+   - **Path:** leave empty.
 
-   `mcp` is the name of the server container on the Compose network. You don't need a Host header override in this setup.
+   `mcp` is the name of the server container on the Compose network. The URL is plain `http` because that hop stays inside Docker; Cloudflare provides HTTPS to Claude. You don't need a Host header override in this setup.
 5. Save.
 
 ## 7. Configure secrets
