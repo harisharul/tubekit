@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Annotated, Any
 
 import anyio
@@ -60,4 +61,23 @@ async def get_video_transcript(
 
 
 def main() -> None:
-    mcp.run()
+    """Run over stdio by default, or Streamable HTTP when MCP_TRANSPORT=http.
+
+    HTTP settings: HOST (default 0.0.0.0), PORT (default 8000, set by most
+    hosts), and MCP_SECRET_PATH, which serves the endpoint at /mcp/<secret>
+    so only people who know the URL can call it.
+    """
+    if os.environ.get("MCP_TRANSPORT", "stdio").lower() not in ("http", "streamable-http"):
+        mcp.run()
+        return
+
+    secret = os.environ.get("MCP_SECRET_PATH", "").strip("/")
+    mcp.run(
+        transport="streamable-http",
+        host=os.environ.get("HOST", "0.0.0.0"),
+        port=int(os.environ.get("PORT", "8000")),
+        streamable_http_path=f"/mcp/{secret}" if secret else "/mcp",
+        # Stateless so any instance can serve any request (scale-to-zero friendly).
+        stateless_http=True,
+        json_response=True,
+    )
