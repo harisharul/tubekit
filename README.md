@@ -6,6 +6,7 @@ An MCP server, built on [yt-dlp](https://github.com/yt-dlp/yt-dlp), with two rea
 |---|---|
 | `list_playlist_videos(playlist, start=1, end?, title_filter?)` | Lists playlist videos as `position. title [id] duration`. Returns 50 per call by default, 200 at most. Only the requested range is fetched from YouTube. `title_filter` returns only titles that contain all the given words. |
 | `get_video_transcript(video, language="en", prefer_manual=true, include_timestamps=false, start_time?, end_time?, offset=0, max_chars=20000)` | Returns a transcript one page at a time. You can limit it to a time window (`"10:00"`-`"15:00"`); the first page lists the video's chapters so Claude can jump to a section. |
+| `search_transcript(video, keywords, language="en", max_results=10, snippets=true)` | Finds *when* topics come up without reading the transcript. Claude passes the user's term plus synonyms (e.g. `["loss function", "cost function", "cross-entropy", "MSE"]`). Returns time ranges with hit counts, a short quote, matching chapters, keywords with zero hits, and a ready-to-use `get_video_transcript` call for the best range. It's a plain text scan of the cached transcript: no index, no model, nothing stored. |
 
 ### Designed to save tokens
 
@@ -24,8 +25,17 @@ Measured on a 246-video playlist and a 39-minute video (the old figures include 
 | Videos with "fractal" in the title | ~28k tokens | ~290 tokens |
 | One minute of a transcript, with timestamps | ~20k tokens (whole video) | ~340 tokens |
 | Whole transcript | ~16k tokens in one call | ~5k tokens per page |
+| Where is X discussed? (6 keywords, 10 ranges) | ~16k tokens (whole transcript) | ~600 tokens, or ~170 without quotes |
 
 The server uses creator-uploaded captions when they exist and auto-generated ones otherwise. Regional variants count as a match, so asking for `en` can return `en-US`. If the requested language doesn't exist, the error lists the languages that do.
+
+## Tests
+
+```bash
+uv run pytest
+```
+
+The search tests use saved caption data and need no network access.
 
 ## Requirements
 

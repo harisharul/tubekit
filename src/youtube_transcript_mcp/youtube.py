@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from bisect import bisect_right
 from functools import lru_cache
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -264,6 +265,12 @@ def _load_transcript(url: str, language: str, prefer_manual: bool) -> dict[str, 
     }
 
 
+def _load_for(video: str, language: str, prefer_manual: bool) -> dict[str, Any]:
+    vid = video_id(video)
+    url = f"https://www.youtube.com/watch?v={vid}" if vid else video.strip()
+    return _load_transcript(url, language, prefer_manual)
+
+
 def get_transcript(
     video: str,
     language: str = "en",
@@ -279,9 +286,7 @@ def get_transcript(
     `offset` is a segment index within the time window; the result's `next_offset`
     continues where this page stopped.
     """
-    vid = video_id(video)
-    url = f"https://www.youtube.com/watch?v={vid}" if vid else video.strip()
-    data = _load_transcript(url, language, prefer_manual)
+    data = _load_for(video, language, prefer_manual)
 
     t0, t1 = parse_time(start_time), parse_time(end_time)
     window = [
@@ -311,3 +316,134 @@ def get_transcript(
         "next_offset": next_offset,
         "transcript": ("\n" if include_timestamps else " ").join(lines),
     }
+
+
+# --------------------------------------------------------------------------- search
+
+# \w misses Unicode combining marks, which Indic scripts (Devanagari, Tamil, ...)
+# use for vowel signs; count them as word characters so matches stay whole-word.
+_WORD = r"[\ẁ-ͯऀ-෿]"
+_SEP = r"[^\ẁ-ͯऀ-෿]+"
+# Keywords containing other symbols (C++, C#, .NET) are matched literally.
+_SYMBOLS_RE = re.compile(r"[^\w\s̀-ͯऀ-෿'\-]")
+
+
+def keyword_pattern(keyword: str) -> re.Pattern[str]:
+    """Case-insensitive pattern matching a keyword at word starts.
+
+    Each word may take a suffix ("function" matches "functions") and the words
+    of a phrase may be separated by any spaces or punctuation ("cross entropy"
+    matches "cross-entropy"). Words must start at a word boundary, so "loss"
+    does not match "glossary".
+    """
+    keyword = keyword.strip()
+    if _SYMBOLS_RE.search(keyword):
+        body = re.escape(keyword)
+    else:
+        words = re.findall(f"{_WORD}+", keyword)
+        if not words:
+            raise YouTubeError(f"Keyword '{keyword}' has no searchable characters.")
+        body = _SEP.join(re.escape(w) + f"{_WORD}*" for w in words)
+    return re.compile(f"(?<!{_WORD}){body}", re.IGNORECASE)
+
+
+def _snippet(text: str, start: int, end: int, before: int = 50, after: int = 80) -> str:
+    lo, hi = max(0, start - before), min(len(text), end + after)
+    # Trim to whole words at both edges.
+    if lo > 0 and (cut := text.find(" ", lo, start)) != -1:
+        lo = cut + 1
+    if hi < len(text) and (cut := text.rfind(" ", end, hi)) != -1:
+        hi = cut
+    return ("..." if lo > 0 else "") + text[lo:hi].strip() + ("..." if hi < len(text) else "")
+
+
+def search_segments(
+    segments: list[dict[str, Any]],
+    keywords: list[str],
+    chapters: list[dict[str, Any]] | None = None,
+    duration: float | None = None,
+    max_results: int = 10,
+    merge_gap: float = 30.0,
+) -> dict[str, Any]:
+    """Find where keywords are spoken and group nearby hits into time ranges.
+
+    Segments are joined into one string before matching so a phrase split
+    across two caption lines is still found. Ranges are ranked by how many
+    different keywords they contain, then by total hits; the best
+    `max_results` are returned in time order.
+    """
+    # Keywords that compile to the same pattern ("speech to text" and
+    # "speech-to-text") would double-count every hit; keep the first spelling.
+    patterns: dict[str, re.Pattern[str]] = {}
+    for k in (k.strip() for k in keywords):
+        if k and (p := keyword_pattern(k)).pattern.lower() not in {q.pattern.lower() for q in patterns.values()}:
+            patterns[k] = p
+    if not patterns:
+        raise YouTubeError("Provide at least one non-empty keyword.")
+    keywords = list(patterns)
+
+    offsets, pieces, pos = [], [], 0
+    for seg in segments:
+        offsets.append(pos)
+        pieces.append(seg["text"])
+        pos += len(seg["text"]) + 1
+    text = " ".join(pieces)
+
+    def seg_end(i: int) -> float:
+        if i + 1 < len(segments):
+            return segments[i + 1]["start"]
+        return max(segments[i]["start"] + 5, duration or 0)
+
+    hits = []  # (segment index, keyword, match start, match end)
+    for kw, pattern in patterns.items():
+        for m in pattern.finditer(text):
+            hits.append((bisect_right(offsets, m.start()) - 1, kw, m.start(), m.end()))
+    hits.sort(key=lambda h: (h[0], h[2]))
+
+    ranges: list[dict[str, Any]] = []
+    for idx, kw, m_start, m_end in hits:
+        t = segments[idx]["start"]
+        current = ranges[-1] if ranges else None
+        if current and t - current["last_hit"] <= merge_gap:
+            current["end"] = max(current["end"], seg_end(idx))
+            current["last_hit"] = t
+        else:
+            current = {"start": t, "end": seg_end(idx), "last_hit": t, "counts": {}, "span": (m_start, m_end)}
+            ranges.append(current)
+        current["counts"][kw] = current["counts"].get(kw, 0) + 1
+
+    for r in ranges:
+        r["snippet"] = _snippet(text, *r.pop("span"))
+        del r["last_hit"]
+
+    ranked = sorted(ranges, key=lambda r: (len(r["counts"]), sum(r["counts"].values())), reverse=True)
+    best = sorted(ranked[:max_results], key=lambda r: r["start"])
+
+    keyword_counts = {k: 0 for k in keywords}
+    for _, kw, _, _ in hits:
+        keyword_counts[kw] += 1
+
+    return {
+        "keyword_counts": keyword_counts,
+        "chapter_matches": [
+            c for c in chapters or [] if any(p.search(c.get("title") or "") for p in patterns.values())
+        ],
+        "total_ranges": len(ranges),
+        "top_range": ranked[0] if ranked else None,
+        "ranges": best,
+    }
+
+
+def search_transcript(
+    video: str,
+    keywords: list[str],
+    language: str = "en",
+    prefer_manual: bool = True,
+    max_results: int = 10,
+) -> dict[str, Any]:
+    data = _load_for(video, language, prefer_manual)
+    result = search_segments(
+        data["segments"], keywords, data["chapters"], data["duration_seconds"], max_results
+    )
+    meta_keys = ("video_id", "title", "channel", "duration_seconds", "language", "auto_generated")
+    return {k: data[k] for k in meta_keys} | result

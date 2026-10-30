@@ -27,6 +27,8 @@ mcp = MCPServer(
     instructions=(
         "Use list_playlist_videos to see what videos a YouTube playlist contains, "
         "then get_video_transcript with a video ID or URL to read what is said in it. "
+        "To answer a question about one topic in a long video, call search_transcript "
+        "first and read only the matching time range. "
         "Both tools return one page at a time: request only the range you need "
         "(start/end, title_filter, start_time/end_time) and follow the 'More:' hint "
         "only when the remaining content is actually needed."
@@ -155,6 +157,87 @@ async def get_video_transcript(
     except youtube.YouTubeError as e:
         raise ToolError(str(e)) from e
     return _format_transcript(data)
+
+
+def _format_search(data: dict[str, Any], video: str) -> str:
+    kind = "auto-generated" if data["auto_generated"] else "manual"
+    lines = [
+        f"Video: {data['title']} | {format_timestamp(data['duration_seconds'])}"
+        f" | id {data['video_id']} | captions {data['language']} ({kind})",
+        "Keywords: " + ", ".join(f'"{k}" {n}' for k, n in data["keyword_counts"].items()),
+    ]
+    if data["chapter_matches"]:
+        lines.append(
+            "Chapter matches: "
+            + "; ".join(f"{format_timestamp(c['start'])} {c['title']}" for c in data["chapter_matches"])
+        )
+    ranges = data["ranges"]
+    if not ranges:
+        lines.append("No matches. Try synonyms, related terms or likely caption misspellings.")
+        return "\n".join(lines)
+
+    shown = len(ranges)
+    lines.append(
+        f"{shown} ranges (time order)"
+        + (f", top {shown} of {data['total_ranges']} by relevance" if data["total_ranges"] > shown else "")
+        + ":"
+    )
+    for i, r in enumerate(ranges, start=1):
+        counts = ", ".join(f"{k} x{n}" for k, n in r["counts"].items())
+        line = f"{i}. [{format_timestamp(r['start'])}-{format_timestamp(r['end'])}] {counts}"
+        if r.get("snippet"):
+            line += f' | "{r["snippet"]}"'
+        lines.append(line)
+
+    top = data["top_range"]
+    lines.append(
+        f'Read more: get_video_transcript(video="{data["video_id"] or video}", '
+        f'start_time="{format_timestamp(max(top["start"] - 10, 0))}", '
+        f'end_time="{format_timestamp(top["end"] + 60)}")'
+    )
+    return "\n".join(lines)
+
+
+@mcp.tool(annotations=READ_ONLY, structured_output=False)
+async def search_transcript(
+    video: Annotated[str, Field(description="Video URL or 11-character video ID.")],
+    keywords: Annotated[
+        list[Annotated[str, Field(min_length=1, max_length=100)]],
+        Field(
+            description="3-8 words or phrases to find. Include the user's term plus synonyms, "
+            "related technical terms, abbreviations and likely caption misspellings, "
+            "in the caption language. E.g. for 'loss functions': ['loss function', "
+            "'cost function', 'cross-entropy', 'mean squared error', 'MSE'].",
+            min_length=1,
+            max_length=10,
+        ),
+    ],
+    language: Annotated[str, Field(description="Caption language code, e.g. 'en', 'hi', 'ta'.")] = "en",
+    prefer_manual: Annotated[
+        bool, Field(description="Prefer creator-uploaded captions over auto-generated ones.")
+    ] = True,
+    max_results: Annotated[int, Field(description="Maximum time ranges to return.", ge=1, le=50)] = 10,
+    snippets: Annotated[
+        bool, Field(description="Include a short quote per range. False returns timestamps only.")
+    ] = True,
+) -> str:
+    """Find when topics are discussed in a YouTube video, without reading the transcript.
+
+    Matches keywords (case-insensitive, whole words, plurals and hyphenation
+    tolerated) and returns the time ranges where they occur, with hit counts and a
+    short quote. Then read just the relevant part with get_video_transcript
+    start_time/end_time. If a keyword has 0 hits, retry with other wording.
+    """
+    try:
+        data = await anyio.to_thread.run_sync(
+            youtube.search_transcript, video, keywords, language, prefer_manual, max_results
+        )
+    except youtube.YouTubeError as e:
+        raise ToolError(str(e)) from e
+    if not snippets:
+        for r in data["ranges"]:
+            r.pop("snippet", None)
+    return _format_search(data, video)
 
 
 def main() -> None:
