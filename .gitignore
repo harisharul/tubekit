@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 cookies.txt
+.env
+secret.txt
+server.log

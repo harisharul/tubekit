@@ -55,6 +55,10 @@ MCP_TRANSPORT=http PORT=8000 MCP_SECRET_PATH=change-me uv run youtube-transcript
 
 The endpoint is `http://<host>:8000/mcp/change-me`.
 
+### Option 0: Windows + WSL + Docker with your own domain (recommended for home use)
+
+See [docs/wsl-docker-setup.md](docs/wsl-docker-setup.md). It uses `docker compose`, a named Cloudflare tunnel, a permanent URL, and auto-start at login.
+
 ### Option A: Google Cloud Run (Mumbai region)
 
 ```bash
