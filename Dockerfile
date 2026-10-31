@@ -1,5 +1,5 @@
 # Pinned by digest; Dependabot proposes updates.
-FROM ghcr.io/astral-sh/uv:0.11.32-python3.13-trixie-slim@sha256:fb576a1ff0c6b967e8b466695af934e34161c4a99c2fbfb859261d4a24d4a8d3
+FROM ghcr.io/astral-sh/uv:0.13.6-python3.13-trixie-slim@sha256:e586c1c65b7071aec78f02c5587c76c5011159cd76b3d6f1255f40e48e850abc
 
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_NO_CACHE=1
