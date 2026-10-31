@@ -9,6 +9,7 @@
 [![MCP](https://img.shields.io/badge/MCP-server-8A2BE2)](https://modelcontextprotocol.io)
 [![Docker image](https://img.shields.io/badge/ghcr.io-tubekit-2496ED?logo=docker&logoColor=white)](https://github.com/harisharul/tubekit/pkgs/container/tubekit)
 [![Built on yt-dlp](https://img.shields.io/badge/built%20on-yt--dlp-FF0000?logo=youtube&logoColor=white)](https://github.com/yt-dlp/yt-dlp)
+[![License: MIT](https://img.shields.io/badge/license-MIT-22C55E)](LICENSE)
 
 [Features](#-features) · [Quick start](#-quick-start) · [Tools](#-tools) · [Remote access](#-use-it-from-claudeai-web--mobile) · [Configuration](#%EF%B8%8F-configuration) · [Security](#-security) · [FAQ](#-faq)
 
@@ -349,6 +350,10 @@ tests/            # offline unit and security regression tests
 ```
 
 </details>
+
+## 📄 License
+
+[MIT](LICENSE). Free to use, modify and share, including commercially. Keep the copyright notice.
 
 ## 🙏 Acknowledgements
 
