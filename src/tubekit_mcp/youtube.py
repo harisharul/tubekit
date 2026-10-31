@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from bisect import bisect_right
+from contextlib import contextmanager
 from functools import lru_cache
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -19,7 +21,17 @@ from yt_dlp.utils import DownloadError
 CAPTION_CLIENT_FALLBACKS: list[list[str] | None] = [None, ["web_embedded"], ["tv_simply"], ["mweb"]]
 
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
-_PLAYLIST_ID_RE = re.compile(r"^(PL|UU|LL|FL|RD|OL)[A-Za-z0-9_-]+$")
+_PLAYLIST_ID_RE = re.compile(r"^(PL|UU|LL|FL|RD|OL)[A-Za-z0-9_-]{8,62}$")
+_YOUTUBE_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
+
+# Abuse limits. Inputs are always reduced to a YouTube ID and rebuilt as a
+# canonical youtube.com URL, so tools can never be pointed at other hosts (SSRF).
+MAX_PLAYLIST_POSITION = 5000  # yt-dlp pages through everything before `start`
+MAX_FILTER_SCAN = 2000  # videos scanned for title_filter
+MAX_CAPTION_BYTES = 5 * 1024 * 1024  # ~10 hours of captions
+SOCKET_TIMEOUT = 20
+# Concurrent YouTube fetches; beyond this, requests wait briefly, then fail.
+_fetch_slots = threading.BoundedSemaphore(int(os.environ.get("TUBEKIT_MAX_CONCURRENCY", "4")))
 
 
 class YouTubeError(Exception):
@@ -34,6 +46,9 @@ def _base_opts() -> dict[str, Any]:
         "noprogress": True,
         # stdout is the MCP stdio channel; never let yt-dlp write to it.
         "logtostderr": True,
+        "socket_timeout": SOCKET_TIMEOUT,
+        # Defense in depth against SSRF: never fall back to the generic extractor.
+        "allowed_extractors": ["youtube", "youtube:tab", "youtube:playlist"],
     }
     if cookie_file := os.environ.get("YT_COOKIES_FILE"):
         opts["cookiefile"] = cookie_file
@@ -46,16 +61,39 @@ def _base_opts() -> dict[str, Any]:
     return opts
 
 
+@contextmanager
+def _youtube_slot():
+    if not _fetch_slots.acquire(timeout=30):
+        raise YouTubeError("Server is busy; retry in a minute.")
+    try:
+        yield
+    finally:
+        _fetch_slots.release()
+
+
+def _is_youtube_host(host: str | None) -> bool:
+    host = (host or "").lower()
+    return any(host == h or host.endswith("." + h) for h in _YOUTUBE_HOSTS)
+
+
+def _parse_youtube_url(value: str):
+    parsed = urlparse(value if "//" in value else f"https://{value}")
+    if parsed.scheme in ("http", "https") and _is_youtube_host(parsed.hostname):
+        return parsed
+    return None
+
+
 def video_id(video: str) -> str | None:
-    """Extract the 11-character ID from a video ID or any common YouTube URL form."""
+    """Extract the 11-character ID from a video ID or a YouTube URL; None otherwise."""
     video = video.strip()
     if _VIDEO_ID_RE.match(video):
         return video
-    parsed = urlparse(video if "//" in video else f"https://{video}")
+    if not (parsed := _parse_youtube_url(video)):
+        return None
     if v := parse_qs(parsed.query).get("v"):
         return v[0] if _VIDEO_ID_RE.match(v[0]) else None
     parts = [p for p in parsed.path.split("/") if p]
-    if parsed.netloc.endswith("youtu.be") and parts:
+    if parsed.hostname.lower().endswith("youtu.be") and parts:
         candidate = parts[0]
     elif len(parts) >= 2 and parts[0] in ("shorts", "live", "embed", "v"):
         candidate = parts[1]
@@ -64,11 +102,26 @@ def video_id(video: str) -> str | None:
     return candidate if _VIDEO_ID_RE.match(candidate) else None
 
 
-def normalize_playlist_url(playlist: str) -> str:
+def video_url(video: str) -> str:
+    if not (vid := video_id(video)):
+        raise YouTubeError("Not a YouTube video URL or 11-character video ID.")
+    return f"https://www.youtube.com/watch?v={vid}"
+
+
+def playlist_id(playlist: str) -> str | None:
+    """Extract a playlist ID from an ID or a YouTube URL with a list= parameter."""
     playlist = playlist.strip()
     if _PLAYLIST_ID_RE.match(playlist):
-        return f"https://www.youtube.com/playlist?list={playlist}"
-    return playlist
+        return playlist
+    if (parsed := _parse_youtube_url(playlist)) and (lst := parse_qs(parsed.query).get("list")):
+        return lst[0] if _PLAYLIST_ID_RE.match(lst[0]) else None
+    return None
+
+
+def playlist_url(playlist: str) -> str:
+    if not (pid := playlist_id(playlist)):
+        raise YouTubeError("Not a YouTube playlist URL or playlist ID.")
+    return f"https://www.youtube.com/playlist?list={pid}"
 
 
 def format_timestamp(seconds: float | None) -> str:
@@ -97,14 +150,13 @@ def parse_time(value: float | str | None) -> float | None:
 # --------------------------------------------------------------------------- playlists
 
 
-def _fetch_playlist(playlist: str, items: str | None) -> dict[str, Any]:
-    opts = _base_opts() | {"extract_flat": "in_playlist"}
-    if items:
-        # Only the requested range is fetched from YouTube, not the whole list.
-        opts["playlist_items"] = items
+def _fetch_playlist(playlist: str, items: str) -> dict[str, Any]:
+    url = playlist_url(playlist)
+    # Only the requested range is fetched from YouTube, not the whole list.
+    opts = _base_opts() | {"extract_flat": "in_playlist", "playlist_items": items}
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(normalize_playlist_url(playlist), download=False)
+        with _youtube_slot(), yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
     except DownloadError as e:
         raise YouTubeError(str(e)) from e
     if not info or info.get("_type") != "playlist":
@@ -117,14 +169,19 @@ def list_playlist(
 ) -> dict[str, Any]:
     """Return playlist videos at positions start..end (1-based, inclusive).
 
-    With title_filter, the whole playlist is scanned and start/end page through
-    the matches instead, so only matching titles are returned to the model.
+    With title_filter, the first MAX_FILTER_SCAN videos are scanned and start/end
+    page through the matches instead, so only matching titles reach the model.
     """
     if end is not None and end < start:
         raise YouTubeError(f"end ({end}) must be >= start ({start}).")
+    if start > MAX_PLAYLIST_POSITION:
+        raise YouTubeError(f"start can be at most {MAX_PLAYLIST_POSITION}.")
+    end = min(end, MAX_PLAYLIST_POSITION) if end else MAX_PLAYLIST_POSITION
 
+    scanned = None
     if title_filter:
-        info = _fetch_playlist(playlist, None)
+        info = _fetch_playlist(playlist, f"1-{MAX_FILTER_SCAN}")
+        scanned = len(info.get("entries") or [])
         words = title_filter.lower().split()
         entries = [
             (pos, e)
@@ -134,7 +191,7 @@ def list_playlist(
         matched = len(entries)
         entries = entries[start - 1 : end]
     else:
-        info = _fetch_playlist(playlist, f"{start}-{end}" if end else f"{start}-")
+        info = _fetch_playlist(playlist, f"{start}-{end}")
         entries = [(pos, e) for pos, e in enumerate(info.get("entries") or [], start=start) if e]
         matched = None
 
@@ -154,6 +211,7 @@ def list_playlist(
         "channel": info.get("channel") or info.get("uploader"),
         "total_videos": total,
         "matched_videos": matched,
+        "scanned_videos": scanned,
         "videos": videos,
     }
 
@@ -214,8 +272,12 @@ def _pick_track(
 
 
 def _parse_json3(raw: str) -> list[dict[str, Any]]:
+    try:
+        events = json.loads(raw).get("events", [])
+    except (ValueError, AttributeError):
+        raise YouTubeError("Could not parse the caption track.") from None
     segments = []
-    for event in json.loads(raw).get("events", []):
+    for event in events:
         text = "".join(seg.get("utf8", "") for seg in event.get("segs") or [])
         text = text.replace("\n", " ").strip()
         if not text:
@@ -224,31 +286,39 @@ def _parse_json3(raw: str) -> list[dict[str, Any]]:
     return segments
 
 
-@lru_cache(maxsize=32)
+@lru_cache(maxsize=16)
 def _load_transcript(url: str, language: str, prefer_manual: bool) -> dict[str, Any]:
     """Fetch and parse a caption track once; paging through it reuses this result.
 
     Cached results are shared between calls, so callers must not mutate them.
     Failures raise and are therefore never cached.
     """
-    info = _extract_video_info(url)
-    code, is_auto, formats = _pick_track(info, language, prefer_manual)
+    with _youtube_slot():
+        info = _extract_video_info(url)
+        code, is_auto, formats = _pick_track(info, language, prefer_manual)
 
-    fmt = next((f for f in formats if f.get("ext") == "json3"), None)
-    if fmt is None:
-        raise YouTubeError(f"No json3 caption format available for '{code}'.")
+        fmt = next((f for f in formats if f.get("ext") == "json3"), None)
+        if fmt is None:
+            raise YouTubeError(f"No json3 caption format available for '{code}'.")
+        caption = urlparse(fmt["url"])
+        if caption.scheme != "https" or not _is_youtube_host(caption.hostname):
+            raise YouTubeError("Unexpected caption URL host; refusing to fetch it.")
 
-    try:
-        with yt_dlp.YoutubeDL(_base_opts()) as ydl:
-            raw = ydl.urlopen(fmt["url"]).read().decode("utf-8")
-    except Exception as e:  # network / HTTP errors from yt-dlp's request layer
-        msg = f"Failed to download captions: {e}"
-        if "429" in str(e):
-            msg += (
-                ". YouTube is rate-limiting caption requests (common for auto-translated"
-                " tracks); retry later, try the original language, or set YT_COOKIES_FILE."
-            )
-        raise YouTubeError(msg) from e
+        try:
+            with yt_dlp.YoutubeDL(_base_opts()) as ydl:
+                body = ydl.urlopen(fmt["url"]).read(MAX_CAPTION_BYTES + 1)
+        except Exception as e:  # network / HTTP errors from yt-dlp's request layer
+            msg = f"Failed to download captions: {e}"
+            if "429" in str(e):
+                msg += (
+                    ". YouTube is rate-limiting caption requests (common for auto-translated"
+                    " tracks); retry later or try the original language."
+                )
+            raise YouTubeError(msg) from e
+
+    if len(body) > MAX_CAPTION_BYTES:
+        raise YouTubeError("Caption track is too large to process.")
+    raw = body.decode("utf-8", errors="replace")
 
     return {
         "video_id": info.get("id"),
@@ -266,9 +336,7 @@ def _load_transcript(url: str, language: str, prefer_manual: bool) -> dict[str, 
 
 
 def _load_for(video: str, language: str, prefer_manual: bool) -> dict[str, Any]:
-    vid = video_id(video)
-    url = f"https://www.youtube.com/watch?v={vid}" if vid else video.strip()
-    return _load_transcript(url, language, prefer_manual)
+    return _load_transcript(video_url(video), language, prefer_manual)
 
 
 def get_transcript(

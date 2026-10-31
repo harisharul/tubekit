@@ -2,7 +2,7 @@
 
 import pytest
 
-from youtube_transcript_mcp.youtube import YouTubeError, keyword_pattern, search_segments, video_id
+from tubekit_mcp.youtube import YouTubeError, keyword_pattern, search_segments, video_id
 
 
 def segs(*items):

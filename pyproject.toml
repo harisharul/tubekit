@@ -1,7 +1,7 @@
 [project]
-name = "youtube-transcript-mcp"
+name = "tubekit-mcp"
 version = "0.1.0"
-description = "MCP server to list YouTube playlist videos and fetch video transcripts using yt-dlp"
+description = "MCP server with YouTube tools: list playlists, fetch and search video transcripts"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [project.scripts]
-youtube-transcript-mcp = "youtube_transcript_mcp.server:main"
+tubekit-mcp = "tubekit_mcp.server:main"
 
 [build-system]
 requires = ["uv_build>=0.11.32,<0.12.0"]

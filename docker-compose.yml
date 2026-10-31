@@ -1,38 +1,32 @@
-# MCP server + Cloudflare named tunnel. The server is not published on any host
-# port: the only way in is through the tunnel, which reaches it as http://mcp:8000.
+# Runs TubeKit over HTTP at http://127.0.0.1:8000/mcp (only reachable from this machine).
+#   docker compose up -d --build
+# Optional: also run a Cloudflare tunnel (set TUNNEL_TOKEN and COMPOSE_PROFILES=cloudflare in .env).
 services:
   mcp:
     build: .
-    image: youtube-transcript-mcp:latest
+    image: tubekit-mcp:latest
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
     environment:
-      MCP_TRANSPORT: http
-      HOST: 0.0.0.0
-      PORT: "8000"
-      MCP_SECRET_PATH: ${MCP_SECRET_PATH:?set MCP_SECRET_PATH in .env}
-      # Uncomment (and the volume below) if YouTube starts demanding sign-in.
-      # YT_COOKIES_FILE: /run/secrets/cookies.txt
-    # volumes:
-    #   - ./cookies.txt:/run/secrets/cookies.txt:ro
+      MCP_SECRET_PATH: ${MCP_SECRET_PATH:-}
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-}
+      TUBEKIT_MAX_CONCURRENCY: ${TUBEKIT_MAX_CONCURRENCY:-4}
     read_only: true
     tmpfs:
       - /tmp
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    healthcheck:
-      test: ["CMD", "python", "-c", "import os, socket; socket.create_connection(('127.0.0.1', int(os.environ['PORT'])), 2)"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-      start_interval: 2s
+    mem_limit: 1g
+    pids_limit: 256
 
   tunnel:
+    profiles: [cloudflare]
     image: cloudflare/cloudflared:2026.10.0
     restart: unless-stopped
     command: tunnel --no-autoupdate run
     environment:
-      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN in .env}
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
     depends_on:
       mcp:
         condition: service_healthy
