@@ -70,15 +70,13 @@ docker compose up -d --build
 
 The endpoint is `http://127.0.0.1:8000/mcp`. The container runs as a non-root user with a read-only filesystem, all Linux capabilities dropped, and memory and process limits. To reach it from the internet, put it behind a reverse proxy or tunnel that provides TLS, and set `MCP_ALLOWED_HOSTS`. `docker-compose.yml` includes an optional Cloudflare tunnel service (see `.env.example`).
 
-To use the image without Compose:
+To run the published image without Compose (multi-arch: amd64 and arm64):
 
 ```bash
-docker build -t tubekit-mcp .
+docker run --rm -p 127.0.0.1:8000:8000 --read-only --tmpfs /tmp --cap-drop ALL ghcr.io/harisharul/tubekit:latest
 ```
 
-```bash
-docker run --rm -p 127.0.0.1:8000:8000 --read-only --tmpfs /tmp --cap-drop ALL tubekit-mcp
-```
+Images are published from `main` by GitHub Actions, tagged `latest` and `sha-<commit>`. Pin a `sha-` tag in deployments. Each image carries signed build provenance and an SBOM.
 
 ## Configuration
 
