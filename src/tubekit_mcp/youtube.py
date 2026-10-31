@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import threading
@@ -34,6 +35,26 @@ SOCKET_TIMEOUT = 20
 _fetch_slots = threading.BoundedSemaphore(int(os.environ.get("TUBEKIT_MAX_CONCURRENCY", "4")))
 
 
+log = logging.getLogger("tubekit")
+
+
+class _YtdlpLogger:
+    """Send yt-dlp warnings and errors to the server log (stderr), never to clients."""
+
+    def debug(self, msg: str) -> None:
+        pass
+
+    def info(self, msg: str) -> None:
+        pass
+
+    def warning(self, msg: str) -> None:
+        if "ffmpeg" not in msg:  # irrelevant: we never download media
+            log.warning("yt-dlp: %s", msg)
+
+    def error(self, msg: str) -> None:
+        log.warning("yt-dlp: %s", msg)
+
+
 class YouTubeError(Exception):
     """Raised for user-facing failures (bad input, no captions, blocked requests)."""
 
@@ -41,7 +62,7 @@ class YouTubeError(Exception):
 def _base_opts() -> dict[str, Any]:
     opts: dict[str, Any] = {
         "quiet": True,
-        "no_warnings": True,
+        "logger": _YtdlpLogger(),
         "skip_download": True,
         "noprogress": True,
         # stdout is the MCP stdio channel; never let yt-dlp write to it.
@@ -227,16 +248,23 @@ def _extract_video_info(url: str) -> dict[str, Any]:
         opts = _base_opts() | {"ignore_no_formats_error": True}
         if clients:
             opts["extractor_args"] = {"youtube": {"player_client": clients}}
+        client = ",".join(clients) if clients else "default"
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
         except DownloadError as e:
+            log.warning("player client %s failed for %s", client, url)
             last_error = e
             continue
         if info and (info.get("subtitles") or info.get("automatic_captions")):
             return info
+        log.warning("player client %s returned no caption tracks for %s", client, url)
     if info:
-        return info
+        raise YouTubeError(
+            "YouTube returned no caption tracks for this video. Either it has no captions, "
+            "or YouTube is withholding them from this server (a bot check on its IP address); "
+            "try again later."
+        )
     raise YouTubeError(str(last_error) if last_error else "Could not extract video info.")
 
 

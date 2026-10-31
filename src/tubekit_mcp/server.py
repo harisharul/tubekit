@@ -7,6 +7,7 @@ tokens. Each result says how to fetch the next page when there is more.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Annotated, Any
 
@@ -302,6 +303,8 @@ def main() -> None:
     (serve at /mcp/<secret>), MCP_ALLOWED_HOSTS (comma-separated Host headers to
     accept) and MCP_MAX_CONNECTIONS (default 100).
     """
+    # Logs go to stderr: stdout is the MCP channel in stdio mode.
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     if os.environ.get("MCP_TRANSPORT", "stdio").lower() in ("http", "streamable-http"):
         _serve_http()
     else:
